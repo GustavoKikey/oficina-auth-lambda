@@ -1,13 +1,14 @@
 import { cpfValido, normalizar } from './cpf.js';
-import { buscarPorDocumento } from './cliente-repo.js';
+import { buscarPorDocumento } from './cliente-api.js';
 import { emitirToken } from './token.js';
 
 /**
- * Handler da Function Serverless de autenticação (fase 3).
+ * Handler da Function Serverless de autenticação (fases 3 e 4).
  *
  * Fluxo exigido pelo enunciado:
  *   1. valida o CPF do cliente;
- *   2. consulta a existência e o status do cliente na base;
+ *   2. consulta a existência e o status do cliente no OS Service, dono dos
+ *      clientes (fase 4: a função não lê mais banco nenhum — ADR 011);
  *   3. gera e devolve um JWT válido para as APIs protegidas.
  *
  * Integração: AWS API Gateway, proxy integration (payload v1 ou v2).

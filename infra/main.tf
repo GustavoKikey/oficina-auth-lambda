@@ -1,9 +1,11 @@
 # =====================================================================
-# Repo 1 — Function Serverless de autenticação + API Gateway
+# Function Serverless de autenticação + API Gateway
 # ---------------------------------------------------------------------
-# Terceiro da cadeia: consome rede (repo 2) e banco (repo 3) via SSM.
+# Fase 4: último da cadeia. Consome a rede da plataforma e, do OS Service,
+# a URL do load balancer interno, o token da rota interna e a chave que
+# assina os JWT — tudo pelo SSM. Não lê banco nenhum (ADR 011 do OS Service).
 #
-# Ordem de aplicação: 2 -> 3 -> [1] -> 4
+# Ordem: oficina-infra-k8s -> OS Service (infra/ + deploy) -> [este]
 # =====================================================================
 
 locals {
@@ -24,17 +26,18 @@ locals {
 
 data "aws_ssm_parameter" "subnet_ids" { name = "${local.prefixo_ssm}/rede/subnet-ids" }
 data "aws_ssm_parameter" "sg_lambda" { name = "${local.prefixo_ssm}/rede/sg-lambda-id" }
-data "aws_ssm_parameter" "db_endpoint" { name = "${local.prefixo_ssm}/db/endpoint" }
-data "aws_ssm_parameter" "db_port" { name = "${local.prefixo_ssm}/db/port" }
-data "aws_ssm_parameter" "db_name" { name = "${local.prefixo_ssm}/db/name" }
-data "aws_ssm_parameter" "db_secret_arn" { name = "${local.prefixo_ssm}/db/secret-arn" }
 
-# Credenciais lidas AQUI, no apply — não em runtime pela função.
-# A Lambda vive na VPC sem NAT: não alcançaria o Secrets Manager sozinha,
-# e abrir esse caminho custaria NAT Gateway ou VPC endpoint pago.
-# Trade-off registrado em plano.md, decisão 4.
-data "aws_secretsmanager_secret_version" "banco" {
-  secret_id = nonsensitive(data.aws_ssm_parameter.db_secret_arn.value)
+# Publicados pelo OS Service: a URL só existe depois do deploy dele
+# (scripts/implantar.sh), o token e a chave, depois do infra/ dele.
+data "aws_ssm_parameter" "os_url_interna" { name = "${local.prefixo_ssm}/os/url-interna" }
+data "aws_ssm_parameter" "token_interno" { name = "${local.prefixo_ssm}/os/token-interno" }
+data "aws_ssm_parameter" "jwt_secret_arn" { name = "${local.prefixo_ssm}/jwt/private-key-secret-arn" }
+
+# Lidos AQUI, no apply — não em runtime pela função. A Lambda vive na VPC
+# sem NAT: não alcançaria o Secrets Manager sozinha, e abrir esse caminho
+# custaria NAT Gateway ou VPC endpoint pago.
+data "aws_secretsmanager_secret_version" "jwt" {
+  secret_id = nonsensitive(data.aws_ssm_parameter.jwt_secret_arn.value)
 }
 
 data "aws_iam_role" "lab" {
@@ -43,7 +46,9 @@ data "aws_iam_role" "lab" {
 }
 
 locals {
-  credenciais   = jsondecode(data.aws_secretsmanager_secret_version.banco.secret_string)
+  # Mesma chave que o OS Service usa para os tokens de funcionário: os
+  # serviços validam qualquer JWT da oficina com uma única chave pública.
+  chave_privada = jsondecode(data.aws_secretsmanager_secret_version.jwt.secret_string).privateKey
   role_execucao = var.role_arn_lambda != "" ? var.role_arn_lambda : one(data.aws_iam_role.lab[*].arn)
 }
 
@@ -51,8 +56,8 @@ locals {
 # Empacotamento
 # ---------------------------------------------------------------------
 # Zipa src/ + node_modules já instalados pelo CI (npm ci --omit=dev).
-# Sem layer: as duas dependências (jsonwebtoken, pg) somam poucos MB, e
-# layer adicionaria um artefato a versionar sem ganho real.
+# Sem layer: a única dependência (jsonwebtoken) soma poucos MB; o HTTP para
+# o OS Service usa o fetch nativo do Node.
 
 data "archive_file" "pacote" {
   type        = "zip"
@@ -73,7 +78,8 @@ resource "aws_lambda_function" "auth" {
   function_name = local.nome
   role          = local.role_execucao
   handler       = "src/index.handler"
-  runtime       = "nodejs20.x"
+  # Node 22: o 20 saiu de suporte em abril de 2026.
+  runtime = "nodejs22.x"
 
   filename         = data.archive_file.pacote.output_path
   source_code_hash = data.archive_file.pacote.output_base64sha256
@@ -90,13 +96,11 @@ resource "aws_lambda_function" "auth" {
 
   environment {
     variables = {
-      DB_HOST     = nonsensitive(data.aws_ssm_parameter.db_endpoint.value)
-      DB_PORT     = nonsensitive(data.aws_ssm_parameter.db_port.value)
-      DB_NAME     = nonsensitive(data.aws_ssm_parameter.db_name.value)
-      DB_USER     = local.credenciais.username
-      DB_PASSWORD = local.credenciais.password
+      OS_URL_INTERNA = nonsensitive(data.aws_ssm_parameter.os_url_interna.value)
+      INTERNAL_TOKEN = data.aws_ssm_parameter.token_interno.value
 
-      JWT_PRIVATE_KEY = var.jwt_private_key_base64
+      # base64: variável de ambiente com quebras de linha é frágil.
+      JWT_PRIVATE_KEY = base64encode(local.chave_privada)
       JWT_ISSUER      = var.jwt_issuer
       JWT_EXPIRACAO   = var.jwt_expiracao
     }

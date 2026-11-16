@@ -3,7 +3,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 
 /**
- * Testa o handler ponta a ponta com o banco mockado.
+ * Testa o handler ponta a ponta com a consulta ao OS Service mockada.
  *
  * O foco é o contrato do ADR 001: se o token sair diferente do que a aplicação
  * Quarkus valida, estes testes quebram antes de o problema virar um 401 mudo em
@@ -17,7 +17,7 @@ const CLIENTE_ATIVO = {
 };
 
 const buscarPorDocumento = vi.fn();
-vi.mock('../src/cliente-repo.js', () => ({
+vi.mock('../src/cliente-api.js', () => ({
   buscarPorDocumento: (...args) => buscarPorDocumento(...args),
 }));
 
@@ -63,7 +63,7 @@ describe('handler de autenticação', () => {
     expect(claims.exp - claims.iat).toBe(1800);
   });
 
-  it('busca no banco pelo CPF normalizado, como a coluna é gravada', async () => {
+  it('consulta o OS Service pelo CPF normalizado, como ele é gravado', async () => {
     buscarPorDocumento.mockResolvedValueOnce(CLIENTE_ATIVO);
     await handler({ body: JSON.stringify({ cpf: '529.982.247-25' }) });
     expect(buscarPorDocumento).toHaveBeenCalledWith('52998224725');
@@ -87,7 +87,7 @@ describe('handler de autenticação', () => {
     expect(inexistente.body).toBe(inativo.body);
   });
 
-  it('rejeita CPF inválido com 400, sem tocar no banco', async () => {
+  it('rejeita CPF inválido com 400, sem consultar o OS Service', async () => {
     buscarPorDocumento.mockClear();
     const r = await handler({ body: JSON.stringify({ cpf: '111.111.111-11' }) });
     expect(r.statusCode).toBe(400);
@@ -109,8 +109,8 @@ describe('handler de autenticação', () => {
     expect(r.statusCode).toBe(200);
   });
 
-  it('não vaza detalhe interno quando o banco falha', async () => {
-    buscarPorDocumento.mockRejectedValueOnce(new Error('connection refused: 10.0.1.5:5432'));
+  it('não vaza detalhe interno quando o OS Service falha', async () => {
+    buscarPorDocumento.mockRejectedValueOnce(new Error('OS Service inalcançável (TimeoutError): 10.0.1.5:80'));
     const r = await handler({ body: JSON.stringify({ cpf: '529.982.247-25' }) });
 
     expect(r.statusCode).toBe(500);
