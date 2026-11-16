@@ -1,7 +1,7 @@
 {
   "name": "oficina-auth-lambda",
   "version": "1.0.0",
-  "description": "Function Serverless de autenticacao por CPF - Tech Challenge 15SOAT fase 3",
+  "description": "Function Serverless de autenticacao por CPF - Tech Challenge SOAT (fases 3 e 4)",
   "main": "index.js",
   "directories": {
     "test": "test"
@@ -15,13 +15,12 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "jsonwebtoken": "^9.0.3",
-    "pg": "^8.23.0"
+    "jsonwebtoken": "^9.0.3"
   },
   "devDependencies": {
     "vitest": "^5.0.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

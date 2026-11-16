@@ -1,33 +1,41 @@
 # =====================================================================
-# CI/CD — Function Serverless de autenticação (repo 1)
+# CI/CD — Function Serverless de autenticação
 # ---------------------------------------------------------------------
-# PR              -> testes + validação do Terraform + plan
-# push em homolog -> testes + apply no ambiente 'hom' + smoke test
-# push em main    -> testes + apply no ambiente 'prod' + smoke test
+# PR              -> testes + validação do Terraform
+# push na main    -> testes + deploy no ambiente 'hom' + smoke test
+# Run workflow    -> deploy em 'hom' ou 'prod' (promoção manual)
 #
-# Diferente dos repos de infra pura, aqui existe CÓDIGO: os testes rodam
-# antes de qualquer coisa e barram o deploy.
+# Fase 4: a função consulta o cliente no OS Service (ADR 011) — por isso o
+# deploy depende do OS Service já implantado (a URL do LB interno dele vem
+# do SSM). Com a sessão do Learner Lab fechada ou o OS ainda fora do ar, o
+# deploy é PULADO com aviso, não falha (mesmo critério do CD dos serviços).
+#
+# Os testes rodam antes de tudo e barram o deploy.
 # =====================================================================
 name: CI/CD
 
 on:
   pull_request:
-    branches: [main, homolog]
+    branches: [main]
   push:
-    branches: [main, homolog]
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      ambiente:
+        description: Ambiente
+        type: choice
+        options: [hom, prod]
+        default: hom
 
 concurrency:
   group: lambda-auth-${{ github.ref }}
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 env:
   TF_VERSION: "1.9.8"
-  NODE_VERSION: "20"
+  NODE_VERSION: "22"
   AWS_REGION: us-east-1
 
 jobs:
@@ -37,6 +45,8 @@ jobs:
   testes:
     name: Testes (Vitest)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -48,8 +58,8 @@ jobs:
       - run: npm ci
 
       # Cobrem a validação de CPF (incluindo equivalência com o algoritmo
-      # Java) e o contrato do token do ADR 001. Se o contrato mudar aqui
-      # sem mudar na aplicação, estes testes quebram — que é o objetivo.
+      # Java), o contrato do token do ADR 001 e o contrato com a rota
+      # interna do OS Service (ADR 011).
       - name: Testes
         run: npm test
 
@@ -59,6 +69,8 @@ jobs:
   terraform-validar:
     name: Terraform — formato e sintaxe
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: infra
@@ -77,31 +89,24 @@ jobs:
   # 3) Deploy
   # ===================================================================
   deploy:
-    name: Deploy (${{ github.ref_name == 'main' && 'prod' || 'hom' }})
+    name: Deploy (${{ inputs.ambiente || 'hom' }})
     needs: [testes, terraform-validar]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    environment: ${{ github.ref_name == 'main' && 'prod' || 'hom' }}
-    outputs:
-      invoke_url: ${{ steps.saida.outputs.invoke_url }}
+    permissions:
+      contents: read
+    environment: ${{ inputs.ambiente || 'hom' }}
+    # Tudo o que entra nos scripts passa por variável de ambiente.
+    env:
+      AMBIENTE: ${{ inputs.ambiente || 'hom' }}
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+      TF_LOCK_TABLE: ${{ secrets.TF_LOCK_TABLE }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-
-      # --omit=dev: o zip da função não leva vitest nem nada de teste.
-      # O Terraform empacota o que estiver em node_modules neste momento.
-      - name: Dependências de produção
-        run: npm ci --omit=dev
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
       - name: Credenciais AWS
+        id: aws
+        continue-on-error: true
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -109,26 +114,62 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: O ambiente está no ar?
+        id: ambiente
+        env:
+          RESULTADO_CREDENCIAIS: ${{ steps.aws.outcome }}
+        run: |
+          motivo=""
+          if [ "$RESULTADO_CREDENCIAIS" != success ] || ! aws sts get-caller-identity >/dev/null 2>&1; then
+            motivo="credenciais AWS vencidas (sessão do Learner Lab fechada)"
+          elif ! aws ssm get-parameter --name "/oficina/${AMBIENTE}/os/url-interna" >/dev/null 2>&1; then
+            motivo="OS Service ainda não implantado em '${AMBIENTE}' (sem /oficina/${AMBIENTE}/os/url-interna)"
+          fi
+          if [ -n "$motivo" ]; then
+            echo "disponivel=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Deploy pulado: ${motivo}."
+            echo "## Deploy pulado — ${motivo}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "disponivel=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.ambiente.outputs.disponivel == 'true'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # --omit=dev: o zip da função não leva vitest nem nada de teste.
+      # O Terraform empacota o que estiver em node_modules neste momento.
+      - name: Dependências de produção
+        if: steps.ambiente.outputs.disponivel == 'true'
+        run: npm ci --omit=dev
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.ambiente.outputs.disponivel == 'true'
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
       - name: Init
+        if: steps.ambiente.outputs.disponivel == 'true'
         working-directory: infra
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
-            -backend-config="key=lambda-auth/${{ github.ref_name == 'main' && 'prod' || 'hom' }}/terraform.tfstate"
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="dynamodb_table=${TF_LOCK_TABLE}" \
+            -backend-config="key=lambda-auth/${AMBIENTE}/terraform.tfstate"
 
-      # A chave privada vem do secret em base64 e é injetada como variável
-      # de ambiente da função. Nunca aparece no log: o Terraform trata a
-      # variável como sensitive e o GitHub mascara o secret.
+      # URL interna, token e chave privada vêm do SSM/Secrets Manager no
+      # apply (infra/main.tf): nada disso passa pelo GitHub.
       - name: Apply
+        if: steps.ambiente.outputs.disponivel == 'true'
         working-directory: infra
-        run: |
-          terraform apply -auto-approve -input=false \
-            -var="ambiente=${{ github.ref_name == 'main' && 'prod' || 'hom' }}" \
-            -var="jwt_private_key_base64=${{ secrets.JWT_PRIVATE_KEY_BASE64 }}"
+        run: terraform apply -auto-approve -input=false -var="ambiente=${AMBIENTE}"
 
       - name: Captura a URL do gateway
         id: saida
+        if: steps.ambiente.outputs.disponivel == 'true'
         working-directory: infra
         run: echo "invoke_url=$(terraform output -raw invoke_url)" >> "$GITHUB_OUTPUT"
 
@@ -136,8 +177,10 @@ jobs:
       # voltar 400 — resposta que só a função consegue dar. Se o gateway
       # ou a Lambda estiverem quebrados, vem 500 ou 502 e o job falha.
       - name: Smoke test
+        if: steps.ambiente.outputs.disponivel == 'true'
+        env:
+          URL: ${{ steps.saida.outputs.invoke_url }}/auth/cliente
         run: |
-          URL="${{ steps.saida.outputs.invoke_url }}/auth/cliente"
           echo "Testando $URL"
           codigo=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
             --retry 5 --retry-delay 3 --retry-all-errors \
@@ -148,10 +191,12 @@ jobs:
           echo "Smoke test OK: a funcao esta no ar e validando CPF."
 
       - name: Resumo
-        if: always()
+        if: always() && steps.ambiente.outputs.disponivel == 'true'
+        env:
+          URL: ${{ steps.saida.outputs.invoke_url }}
         run: |
           {
-            echo "## Function de autenticação — \`${{ github.ref_name == 'main' && 'prod' || 'hom' }}\`"
+            echo "## Function de autenticação — \`${AMBIENTE}\`"
             echo
-            echo "Endpoint: \`${{ steps.saida.outputs.invoke_url }}/auth/cliente\`"
+            echo "Endpoint: \`${URL}/auth/cliente\`"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -18,21 +18,6 @@ variable "projeto" {
   default = "oficina"
 }
 
-variable "jwt_private_key_base64" {
-  description = <<-EOT
-    Chave privada RSA em base64, para assinar os tokens de cliente.
-
-    Vem do secret JWT_PRIVATE_KEY do GitHub Actions. Base64 evita o
-    problema de quebras de linha em variável de ambiente.
-
-    ATENÇÃO: a chave hoje versionada no repositório da aplicação deve ser
-    considerada comprometida e ROTACIONADA antes do primeiro deploy real
-    (plano.md, decisão 2).
-  EOT
-  type        = string
-  sensitive   = true
-}
-
 variable "jwt_issuer" {
   description = "Issuer do token. Precisa bater com mp.jwt.verify.issuer da aplicação."
   type        = string

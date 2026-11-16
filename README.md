@@ -1,7 +1,8 @@
 # oficina-auth-lambda
 
-Function Serverless de **autenticação por CPF** da oficina — repositório 1 dos 4 do
-Tech Challenge Fase 3 (15SOAT).
+Function Serverless de **autenticação por CPF** da oficina. Nasceu na fase 3; na
+**fase 4** deixou de ler o banco e passou a consultar o cliente no **OS Service**, dono dos
+clientes — nenhum serviço acessa o banco de outro ([ADR 011](https://github.com/GustavoKikey/oficina-os-service/blob/main/docs/fase-4/adr/adr-011-lambda-consulta-os-service.md)).
 
 ## O que faz
 
@@ -9,7 +10,8 @@ Recebe um CPF, decide se aquele cliente pode entrar, e devolve um JWT que as API
 protegidas aceitam:
 
 1. **valida o CPF** (formato + dígitos verificadores);
-2. **consulta existência e status** do cliente no RDS (`clientes.ativo`);
+2. **consulta existência e status** do cliente no OS Service
+   (`GET /internal/clientes`, pelo load balancer interno, com `X-Internal-Token`);
 3. **emite um JWT RS256** conforme o [ADR 001](https://github.com/GustavoKikey/tech-challenge-15SOAT/blob/main/docs/fase-3/adr/adr-001-contrato-jwt-cliente.md).
 
 ## Arquitetura
@@ -22,18 +24,18 @@ flowchart LR
         gw["API Gateway<br/>HTTP API v2<br/>POST /auth/cliente<br/>10 req/s"]
 
         subgraph vpc["VPC default"]
-            fn["Lambda<br/>oficina-{env}-auth<br/>Node.js 20"]
-            db[("RDS PostgreSQL<br/>clientes.documento<br/>clientes.ativo")]
-            app["Aplicação no EKS<br/>valida a assinatura"]
+            fn["Lambda<br/>oficina-{env}-auth<br/>Node.js 22"]
+            lbi["LB interno<br/>OS Service<br/>/internal/clientes"]
+            app["Serviços no EKS<br/>validam a assinatura"]
         end
 
-        ssm[/"SSM Parameter Store<br/>rede · banco · apigw"/]
+        ssm[/"SSM Parameter Store<br/>rede · OS Service · apigw"/]
         logs["CloudWatch Logs<br/>JSON, 14 dias"]
     end
 
     cliente -->|"1 · CPF"| gw
     gw -->|2| fn
-    fn -->|"3 · existe e está ativo?"| db
+    fn -->|"3 · existe e está ativo?"| lbi
     fn -->|"4 · JWT RS256, 30 min"| cliente
     cliente -->|"5 · Bearer"| app
 
@@ -42,22 +44,21 @@ flowchart LR
 
     style fn fill:#fff3e0,stroke:#e08c1a
     style gw fill:#e8f0fc,stroke:#1e6fd9
-    style db fill:#eef7ee,stroke:#1d8a4e
+    style lbi fill:#eef7ee,stroke:#1d8a4e
 ```
 
 Três decisões que o desenho revela:
 
-**A Function fala com o banco, a aplicação não participa da autenticação.** Ela só
-recebe o token pronto e confere a assinatura com a chave pública — não sabe autenticar
-cliente, e não precisa saber.
+**A Function pergunta ao OS Service; os serviços não participam da autenticação.** O
+cliente pertence ao OS Service, então a função consulta a rota interna dele em vez de ler
+o banco. Os serviços só recebem o token pronto e conferem a assinatura com a chave pública.
 
-**Sem saída para a internet.** O security group da função libera apenas a porta 5432,
-e apenas para o security group do banco. Endpoint, senha e chave privada chegam como
-variáveis de ambiente, injetadas no `terraform apply` — não são buscadas em runtime.
+**Sem saída para a internet.** O security group da função libera apenas a porta 80 dentro
+da VPC — o load balancer interno do OS Service. URL, token interno e chave privada chegam
+como variáveis de ambiente, injetadas no `terraform apply` — não são buscadas em runtime.
 
-**Os endereços vêm do Parameter Store.** Nada de rede ou de banco está escrito neste
-repositório: ele lê o que os repositórios 2 e 3 publicaram. É o que permite os quatro
-evoluírem separados.
+**Os endereços vêm do Parameter Store.** Nada de rede ou de URL está escrito neste
+repositório: ele lê o que a plataforma (`oficina-infra-k8s`) e o OS Service publicaram.
 
 ## API
 
@@ -91,9 +92,9 @@ descobrir quais CPFs são clientes da oficina.
 
 | | |
 | --- | --- |
-| Runtime | Node.js 20+ (ESM) |
+| Runtime | Node.js 22 (ESM) — o 20 saiu de suporte em abril de 2026 |
 | JWT | `jsonwebtoken` (RS256) |
-| Banco | `pg` — PostgreSQL no RDS |
+| Consulta do cliente | `fetch` nativo → OS Service |
 | Testes | Vitest |
 
 **Por que Node e não Java**, já que a aplicação é Quarkus: esta função está no
@@ -109,11 +110,12 @@ dos dois lados.
 src/
   index.js         handler — orquestra e traduz para HTTP
   cpf.js           validação de CPF (espelha Documento.java)
-  cliente-repo.js  consulta ao RDS (pool fora do handler)
+  cliente-api.js   consulta ao OS Service (GET /internal/clientes, com timeout)
   token.js         emissão do JWT (contrato do ADR 001)
 test/
   cpf.test.js      14 casos, incluindo equivalência com o algoritmo Java
   handler.test.js  contrato do token, 401 uniforme, base64, erro sem vazamento
+  cliente-api.test.js  contrato com a rota interna: URL, token, 404, 403/5xx, timeout
 ```
 
 ## Rodar os testes
@@ -123,7 +125,7 @@ npm install
 npm test
 ```
 
-Não precisa de banco nem de AWS: o repositório é mockado.
+Node 22+. Não precisa do OS Service nem de AWS: a consulta é mockada.
 
 ## Variáveis de ambiente
 
@@ -133,19 +135,17 @@ runtime (ver [ADR 004](https://github.com/GustavoKikey/tech-challenge-15SOAT/blo
 
 | Variável | Origem | Obrigatória |
 | --- | --- | --- |
-| `DB_HOST` | SSM `/oficina/{env}/db/endpoint` | sim |
-| `DB_NAME` / `DB_USER` / `DB_PASSWORD` | Secrets Manager | sim |
-| `DB_PORT` | — (default `5432`) | não |
-| `DB_SSL` | `false` desliga TLS (só local) | não |
-| `JWT_PRIVATE_KEY` | Secrets Manager — PEM cru ou base64 | sim |
+| `OS_URL_INTERNA` | SSM `/oficina/{env}/os/url-interna` (publicado pelo deploy do OS Service) | sim |
+| `INTERNAL_TOKEN` | SSM `/oficina/{env}/os/token-interno` (SecureString) | sim |
+| `OS_TIMEOUT_MS` | default `5000` | não |
+| `JWT_PRIVATE_KEY` | Secrets Manager (chave gerada pelo Terraform do OS Service) — PEM cru ou base64 | sim |
 | `JWT_ISSUER` | default `oficina-mvp` | não |
 | `JWT_EXPIRACAO` | default `30m` (ADR 001) | não |
 
 ## Interoperabilidade com a aplicação
 
-O token emitido aqui é validado pela aplicação Quarkus com a chave pública
-correspondente. O contrato entre os dois é o ADR 001 — nenhum outro acoplamento
-existe entre a Function e a aplicação.
+O token emitido aqui é validado pelos três serviços com a chave pública
+correspondente. O contrato é o ADR 001; além dele, só a rota interna do ADR 011.
 
 ```
 GET /cliente/ordens-servico  + token da Lambda   → 200, lista as OS do cliente
@@ -166,12 +166,13 @@ console.log(emitirToken({ id: '<uuid-do-cliente>', nome: 'Teste' }, '<cpf>').acc
 
 ## Infraestrutura
 
-`infra/` provisiona a função e o API Gateway. **Terceiro da cadeia** — consome rede
-(repo 2) e banco (repo 3) via SSM.
+`infra/` provisiona a função e o API Gateway. **Último da cadeia** — consome a rede da
+plataforma e, do OS Service, a URL do LB interno, o token e a chave do JWT, via SSM e
+Secrets Manager. O ambiente inteiro sobe com `scripts/aplicar.sh hom` no oficina-infra-k8s.
 
 | Recurso | Configuração |
 | --- | --- |
-| Lambda | Node.js 20, 512 MB, timeout 15s, **dentro da VPC** |
+| Lambda | Node.js 22, 512 MB, timeout 15s, **dentro da VPC** |
 | API Gateway | HTTP API (v2), rota `POST /auth/cliente` |
 | Throttling | 10 req/s, rajada de 20 — protege contra força bruta de CPF |
 | Logs | CloudWatch, 14 dias, formato JSON com `requestId` |
@@ -186,9 +187,7 @@ terraform init \
   -backend-config="bucket=oficina-tfstate-SEU-SUFIXO" \
   -backend-config="dynamodb_table=oficina-tflock-SEU-SUFIXO"
 
-terraform apply \
-  -var="ambiente=hom" \
-  -var="jwt_private_key_base64=$(base64 -w0 caminho/privateKey.pem)"
+terraform apply -var="ambiente=hom"
 ```
 
 ## CI/CD
@@ -198,12 +197,17 @@ terraform apply \
 | Gatilho | O que faz |
 | --- | --- |
 | Pull Request | Testes (Vitest) + `fmt`/`validate` do Terraform |
-| push em `homolog` | Testes → `apply` em `hom` → **smoke test** |
-| push em `main` | Testes → `apply` em `prod` → **smoke test** |
+| push na `main` | Testes → `apply` em `hom` → **smoke test** |
+| *Run workflow* | Testes → `apply` em `hom` ou `prod` (promoção manual) → smoke test |
+
+Com a sessão do Learner Lab fechada, ou com o OS Service ainda não implantado (sem
+`/oficina/{env}/os/url-interna`), o deploy é pulado com aviso em vez de falhar.
 
 O smoke test envia um CPF inválido e exige `400` — resposta que só a função consegue
 dar. Gateway ou Lambda quebrados devolveriam 500/502 e falhariam o job.
 
 Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
-`TF_STATE_BUCKET`, `TF_LOCK_TABLE`, `JWT_PRIVATE_KEY_BASE64`.
+`TF_STATE_BUCKET`, `TF_LOCK_TABLE` (renovados por `scripts/renovar-secrets.sh` do
+oficina-infra-k8s). A chave do JWT não passa mais pelo GitHub: o Terraform a lê do
+Secrets Manager.
 
