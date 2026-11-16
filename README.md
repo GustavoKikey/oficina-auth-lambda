@@ -4,6 +4,8 @@ Function Serverless de **autenticação por CPF** da oficina. Nasceu na fase 3; 
 **fase 4** deixou de ler o banco e passou a consultar o cliente no **OS Service**, dono dos
 clientes — nenhum serviço acessa o banco de outro ([ADR 011](https://github.com/GustavoKikey/oficina-os-service/blob/main/docs/fase-4/adr/adr-011-lambda-consulta-os-service.md)).
 
+> Checklist da entrega da fase 4 (requisito → onde está): [README do OS Service](https://github.com/GustavoKikey/oficina-os-service#entrega-da-fase-4--onde-está-cada-requisito).
+
 ## O que faz
 
 Recebe um CPF, decide se aquele cliente pode entrar, e devolve um JWT que as APIs
@@ -179,6 +181,10 @@ Secrets Manager. O ambiente inteiro sobe com `scripts/aplicar.sh hom` no oficina
 
 512 MB não é por consumo de memória: na Lambda a CPU é proporcional à memória, e a
 assinatura RS256 é sensível a isso.
+
+**Validado na AWS em 2026-11-16**, pelo API Gateway: CPF inválido → `400`; CPF válido sem
+cadastro → `401` (a função consultou o OS Service pelo load balancer interno, que respondeu
+404); cliente cadastrada → token emitido e aceito pela área do cliente do OS Service.
 
 ```bash
 cd infra
