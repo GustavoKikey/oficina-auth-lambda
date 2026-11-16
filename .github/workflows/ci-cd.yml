@@ -182,10 +182,17 @@ jobs:
           URL: ${{ steps.saida.outputs.invoke_url }}/auth/cliente
         run: |
           echo "Testando $URL"
-          codigo=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
-            --retry 5 --retry-delay 3 --retry-all-errors \
-            -X POST "$URL" -H 'Content-Type: application/json' \
-            -d '{"cpf":"111.111.111-11"}')
+          # Num API Gateway recém-criado a rota leva alguns segundos para ser
+          # publicada no estágio $default: até lá ele responde 404. Espera até
+          # 1 minuto por uma resposta que não seja 404.
+          for tentativa in $(seq 1 12); do
+            codigo=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+              --retry 3 --retry-delay 2 --retry-all-errors \
+              -X POST "$URL" -H 'Content-Type: application/json' \
+              -d '{"cpf":"111.111.111-11"}')
+            [ "$codigo" != "404" ] && break
+            echo "rota ainda não publicada (404), tentativa $tentativa"; sleep 5
+          done
           echo "HTTP $codigo — $(cat /tmp/resp.json)"
           test "$codigo" = "400" || { echo "Esperado 400 para CPF invalido"; exit 1; }
           echo "Smoke test OK: a funcao esta no ar e validando CPF."
